@@ -2,7 +2,7 @@ module github.com/toitlang/jaguar
 
 go 1.16
 
-require github.com/spf13/cobra v1.8.0
+require github.com/spf13/cobra v1.10.2
 
 require (
 	github.com/blakesmith/ar v0.0.0-20190502131153-809d4375e1fb
@@ -16,7 +16,7 @@ require (
 	github.com/manifoldco/promptui v0.9.0
 	github.com/mitchellh/mapstructure v1.5.0
 	github.com/rogpeppe/go-internal v1.11.0 // indirect
-	github.com/spf13/pflag v1.0.5
+	github.com/spf13/pflag v1.0.9
 	github.com/spf13/viper v1.17.0
 	github.com/toitware/ubjson v0.0.0-20231002110407-71c8fab5e607
 	go.bug.st/serial v1.6.1
