@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+# Copyright (C) 2021 Toitware ApS. All rights reserved.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file.
+
+# Determine the directory of this script and use it to find the
+# cmake file we use to compute the repository version.
+DIRECTORY=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+
+cmake -DPRINT_VERSION=1 -P $DIRECTORY/../third_party/toit/tools/gitversion.cmake

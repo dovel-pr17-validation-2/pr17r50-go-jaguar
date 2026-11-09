@@ -1,0 +1,576 @@
+// Copyright (C) 2024 Toitware ApS. All rights reserved.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/hashicorp/go-version"
+
+	"github.com/google/uuid"
+	"github.com/spf13/cobra"
+	"github.com/toitlang/jaguar/cmd/jag/directory"
+)
+
+type callback func(id string, envelopeFile *os.File, config map[string]interface{}, partitionArgs []string) error
+type probeChip func(ctx context.Context, sdk *SDK) (string, error)
+
+func addFirmwareFlashFlags(cmd *cobra.Command, nameHelp string, hostnameHelp string) {
+	cmd.Flags().String("name", "", nameHelp)
+	cmd.Flags().String("hostname", "", hostnameHelp)
+	cmd.Flags().StringP("chip", "c", "auto", "chip of the target device")
+	cmd.Flags().String("wifi-ssid", "", "default WiFi network name")
+	cmd.Flags().String("wifi-password", "", "default WiFi password")
+	cmd.Flags().Bool("disable-udp", false, "disable UDP device discovery advertisements")
+	cmd.Flags().Bool("exclude-jaguar", false, "don't install the Jaguar service")
+	cmd.Flags().Bool("uart-only", false, fmt.Sprintf("use only the UART endpoint, defaulting to %d baud", defaultProxyBaudRate))
+	cmd.Flags().Uint("uart-endpoint-baud", 0, "enable the UART endpoint at the given baud rate")
+}
+
+// addPartitionTableFlag adds the '--partition-table' flag. It is only meaningful
+// for commands that produce a full flashable image ('flash' and 'firmware
+// extract'); an over-the-air 'firmware update' cannot repartition the device, so
+// it deliberately doesn't offer this flag.
+func addPartitionTableFlag(cmd *cobra.Command) {
+	cmd.Flags().String("partition-table", "", "partition table to use; either a path, a URL, or the name of a published partition table (e.g. 'esp32-ota-1c0000-16mb')")
+}
+
+func withFirmware(cmd *cobra.Command, args []string, probeChip probeChip, device Device, fun callback) error {
+	ctx := cmd.Context()
+
+	info := GetInfo(ctx)
+	jagVersion := info.Version
+
+	sdk, err := GetSDK(ctx)
+	if err != nil {
+		return err
+	}
+
+	chip, err := cmd.Flags().GetString("chip")
+	if err != nil {
+		return err
+	}
+
+	if chip == "auto" || chip == "" {
+		if device != nil {
+			chip = device.Chip()
+		} else if probeChip != nil {
+			// Run the esptool to probe the chip type.
+			probedChip, err := probeChip(ctx, sdk)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Probed chip type: %s\n", probedChip)
+			chip = probedChip
+		} else {
+			chip = ""
+			// We must have an envelope path to get the chip type from.
+			if len(args) != 1 {
+				return fmt.Errorf("chip type must be specified when no envelope is given")
+			}
+		}
+	}
+
+	uartOnly, err := cmd.Flags().GetBool("uart-only")
+	if err != nil {
+		return err
+	}
+	excludeJaguar, err := cmd.Flags().GetBool("exclude-jaguar")
+	if err != nil {
+		return err
+	}
+	if uartOnly && excludeJaguar {
+		return fmt.Errorf("--uart-only cannot be used with --exclude-jaguar")
+	}
+
+	wifiSSID := ""
+	wifiPassword := ""
+	if !uartOnly || cmd.Flags().Changed("wifi-ssid") || cmd.Flags().Changed("wifi-password") {
+		wifiSSID, wifiPassword, err = getWifiCredentials(cmd)
+		if err != nil {
+			return err
+		}
+	}
+	disableUDP, err := cmd.Flags().GetBool("disable-udp")
+	if err != nil {
+		return err
+	}
+
+	id := uuid.New()
+	var name string
+	if cmd.Flags().Changed("name") {
+		name, err = cmd.Flags().GetString("name")
+		if err != nil {
+			return err
+		}
+	} else if device != nil {
+		name = device.Name()
+	} else {
+		name = GetRandomName(id[:])
+	}
+	var hostname string
+	if cmd.Flags().Changed("hostname") {
+		hostname, err = cmd.Flags().GetString("hostname")
+		if err != nil {
+			return err
+		}
+		if hostname == "" || toHostname(hostname) != hostname {
+			return fmt.Errorf("invalid hostname '%s': use letters, digits and hyphens, at most %d characters", hostname, hostnameMaxSize)
+		}
+	} else if device != nil && !cmd.Flags().Changed("name") {
+		hostname = currentHostname(ctx, sdk, device)
+	}
+	if hostname == "" {
+		hostname = toHostname(name)
+	}
+
+	var envelopePath string
+	if len(args) == 1 {
+		// Make a temporary directory for the downloaded envelope.
+		tmpDir, err := os.MkdirTemp("", "*-envelope")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(tmpDir)
+		envelopePath, err = DownloadEnvelope(ctx, args[0], jagVersion, sdk.Version, tmpDir)
+	} else {
+		envelopePath, err = GetCachedFirmwareEnvelopePath(ctx, jagVersion, sdk.Version, chip)
+		if err != nil {
+			return err
+		}
+	}
+
+	envelopeChip, err := GetFirmwareChip(ctx, sdk, envelopePath)
+	if err != nil {
+		return fmt.Errorf("failed to get chip type from envelope: %w", err)
+	}
+
+	if chip != "" {
+		if chip != envelopeChip {
+			isError := true
+			if device != nil {
+				// Older versions of Jaguar (using SDK versions prior to v2.0.0-alpha.189) didn't
+				// set the chip type correctly (and used "esp32" for all ESP32 variants). We allow
+				// firmware updating in that case, but warn the user.
+				deviceVersion, err := version.NewVersion(device.SDKVersion())
+				if err != nil {
+					return fmt.Errorf("failed to parse device SDK version '%s': %w", device.SDKVersion(), err)
+				}
+				correctedVersion, err := version.NewVersion("v2.0.0-alpha.189")
+				if err != nil {
+					return fmt.Errorf("failed to parse corrected version: %w", err)
+				}
+				if chip == "esp32" && deviceVersion.LessThan(correctedVersion) {
+					fmt.Fprintf(os.Stderr, "warning: device chip type is 'esp32', assuming it is compatible with envelope chip '%s'\n", envelopeChip)
+					// Set the chip to the envelope chip to fix the mistake on the device.
+					chip = envelopeChip
+					isError = false
+				}
+			}
+			if isError {
+				return fmt.Errorf("chip type mismatch: expected '%s', but envelope is for '%s'", chip, envelopeChip)
+			}
+		}
+	} else {
+		chip = envelopeChip
+	}
+
+	deviceOptions := DeviceOptions{
+		Id:           id.String(),
+		Name:         name,
+		Hostname:     hostname,
+		Chip:         chip,
+		WifiSsid:     wifiSSID,
+		WifiPassword: wifiPassword,
+		DisableUDP:   disableUDP,
+		UartOnly:     uartOnly,
+	}
+
+	envelopeOptions := EnvelopeOptions{
+		Path:          envelopePath,
+		ExcludeJaguar: excludeJaguar,
+	}
+
+	uartEndpointOptions, err := getUartEndpointOptions(cmd)
+	if err != nil {
+		return err
+	}
+
+	envelopeFile, err := BuildFirmwareEnvelope(ctx, envelopeOptions, deviceOptions, uartEndpointOptions)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(envelopeFile.Name())
+
+	config := deviceOptions.buildFirmwareConfig()
+
+	// The '--partition-table' flag is only registered for commands that produce
+	// a full flashable image ('flash' and 'firmware extract'). For others (e.g.
+	// 'firmware update') we fall back to the automatic per-chip override only.
+	partitionTable := ""
+	if cmd.Flags().Lookup("partition-table") != nil {
+		partitionTable, err = cmd.Flags().GetString("partition-table")
+		if err != nil {
+			return err
+		}
+	}
+
+	partitionArgs, cleanupPartitions, err := partitionOverrideArgs(ctx, chip, partitionTable, jagVersion, sdk.Version)
+	if err != nil {
+		return err
+	}
+	defer cleanupPartitions()
+
+	return fun(id.String(), envelopeFile, config, partitionArgs)
+}
+
+func BuildFirmwareEnvelope(ctx context.Context, envelope EnvelopeOptions, device DeviceOptions, uartEndpointOptions map[string]interface{}) (*os.File, error) {
+	info := GetInfo(ctx)
+	jagVersion := info.Version
+
+	sdk, err := GetSDK(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	envelopeFile, err := os.CreateTemp("", "*.envelope")
+	if err != nil {
+		return nil, err
+	}
+	defer envelopeFile.Close()
+
+	if envelope.ExcludeJaguar {
+		source, err := os.Open(envelope.Path)
+		if err != nil {
+			return nil, err
+		}
+		_, err = io.Copy(envelopeFile, source)
+		source.Close()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		jaguarSnapshot, err := directory.GetJaguarSnapshotPath(jagVersion)
+		if err != nil {
+			return nil, err
+		}
+
+		configAssetMap := device.buildJaguarConfig()
+		if uartEndpointOptions != nil {
+			configAssetMap["endpointUart"] = uartEndpointOptions
+		}
+		configAssetJson, err := json.Marshal(configAssetMap)
+		if err != nil {
+			return nil, err
+		}
+
+		configAssetJsonFile, err := os.CreateTemp("", "*.json.assets")
+		if err != nil {
+			return nil, err
+		}
+		defer configAssetJsonFile.Close()
+
+		if err := os.WriteFile(configAssetJsonFile.Name(), configAssetJson, 0666); err != nil {
+			return nil, err
+		}
+
+		assetsFile, err := os.CreateTemp("", "*.assets")
+		if err != nil {
+			return nil, err
+		}
+		defer assetsFile.Close()
+
+		if err := runAssetsTool(ctx, sdk, assetsFile.Name(), "create"); err != nil {
+			return nil, err
+		}
+
+		if err := runAssetsTool(ctx, sdk, assetsFile.Name(), "add", "--format=tison", "config", configAssetJsonFile.Name()); err != nil {
+			return nil, err
+		}
+
+		if err := runFirmwareTool(ctx, sdk, envelope.Path,
+			"container", "install", "-o", envelopeFile.Name(),
+			"--assets", assetsFile.Name(),
+			"--trigger=boot", "--critical",
+			"jaguar", jaguarSnapshot); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := setFirmwareProperty(ctx, sdk, envelopeFile, "uuid", device.Id); err != nil {
+		return nil, err
+	}
+
+	if err := copySnapshotsIntoCache(ctx, sdk, envelopeFile); err != nil {
+		return nil, err
+	}
+
+	return envelopeFile, nil
+}
+
+func GetFirmwareChip(ctx context.Context, sdk *SDK, envelopePath string) (string, error) {
+	// Run the firmware tool with `show -e <envelopePath> --output-format json` and parse the
+	// output ("chip" field).
+
+	execCmd := sdk.FirmwareTool(ctx, "show", "-e", envelopePath, "--output-format", "json")
+	output, err := execCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to get firmware chip type: %w: %s", err, string(output))
+	}
+
+	var info map[string]interface{}
+	if err := json.Unmarshal(output, &info); err != nil {
+		return "", fmt.Errorf("failed to parse firmware info: %w", err)
+	}
+
+	chip, ok := info["chip"].(string)
+	if !ok {
+		return "", fmt.Errorf("failed to get chip type from firmware info")
+	}
+
+	return chip, nil
+}
+
+type DeviceOptions struct {
+	Id           string
+	Name         string
+	Hostname     string
+	Chip         string
+	WifiSsid     string
+	WifiPassword string
+	DisableUDP   bool
+	UartOnly     bool
+}
+
+type EnvelopeOptions struct {
+	Path          string
+	ExcludeJaguar bool
+}
+
+func (d DeviceOptions) buildJaguarConfig() map[string]interface{} {
+	config := map[string]interface{}{
+		"id":   d.Id,
+		"name": d.Name,
+		"chip": d.Chip,
+	}
+	if d.DisableUDP {
+		config["jag.disable-udp"] = true
+	}
+	if d.UartOnly {
+		config["jag.uart-only"] = true
+	}
+	return config
+}
+
+func (d DeviceOptions) buildFirmwareConfig() map[string]interface{} {
+	config := map[string]interface{}{
+		"wifi": map[string]string{
+			"wifi.ssid":     d.WifiSsid,
+			"wifi.password": d.WifiPassword,
+		},
+	}
+	if d.Hostname != "" {
+		config["hostname"] = d.Hostname
+	}
+	return config
+}
+
+// currentHostname returns the hostname in the device's firmware config, or ""
+// if there is none.
+func currentHostname(ctx context.Context, sdk *SDK, device Device) string {
+	config, err := device.GetConfig(ctx, sdk)
+	if err != nil {
+		// Older Jaguar versions don't support /config.
+		fmt.Fprintf(os.Stderr, "Could not read the current device config, not keeping its hostname: %v\n", err)
+		return ""
+	}
+	hostname, _ := config.Firmware["hostname"].(string)
+	if toHostname(hostname) != hostname {
+		return ""
+	}
+	return hostname
+}
+
+// Max hostname length accepted by the ESP-IDF netif.
+const hostnameMaxSize = 32
+
+// toHostname derives a network hostname from a device name: letters, digits
+// and hyphens only, no leading or trailing hyphen, at most hostnameMaxSize
+// characters. Runs of other characters become a single hyphen. Returns "" if
+// nothing usable is left.
+func toHostname(name string) string {
+	var b strings.Builder
+	pendingHyphen := false
+	for _, r := range name {
+		valid := ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') || ('0' <= r && r <= '9')
+		if !valid {
+			pendingHyphen = b.Len() > 0
+			continue
+		}
+		if pendingHyphen {
+			b.WriteByte('-')
+			pendingHyphen = false
+		}
+		b.WriteRune(r)
+	}
+	hostname := b.String()
+	if len(hostname) > hostnameMaxSize {
+		hostname = strings.TrimRight(hostname[:hostnameMaxSize], "-")
+	}
+	return hostname
+}
+
+func ExtractFirmwareBin(ctx context.Context, sdk *SDK, envelopePath string, config map[string]interface{}, extraArgs ...string) (*os.File, error) {
+	binaryFile, err := os.CreateTemp("", "firmware.bin.*")
+	if err != nil {
+		return nil, err
+	}
+
+	arguments := []string{
+		"extract",
+		"--format=binary",
+		"-o", binaryFile.Name(),
+	}
+	arguments = append(arguments, extraArgs...)
+
+	if err := runFirmwareToolWithConfig(ctx, sdk, envelopePath, config, arguments...); err != nil {
+		binaryFile.Close()
+		os.Remove(binaryFile.Name())
+		return nil, err
+	}
+	return binaryFile, nil
+}
+
+func ExtractFirmware(ctx context.Context, sdk *SDK, envelopePath string, format string, config map[string]interface{}, extraArgs ...string) (*os.File, error) {
+	outputFile, err := os.CreateTemp("", "firmware-"+format+".*")
+	if err != nil {
+		return nil, err
+	}
+	arguments := []string{"extract", "--format", format, "-o", outputFile.Name()}
+	arguments = append(arguments, extraArgs...)
+	if err := runFirmwareToolWithConfig(ctx, sdk, envelopePath, config, arguments...); err != nil {
+		outputFile.Close()
+		os.Remove(outputFile.Name())
+		return nil, err
+	}
+	return outputFile, nil
+}
+
+func setFirmwareProperty(ctx context.Context, sdk *SDK, envelope *os.File, key string, value string) error {
+	return runFirmwareTool(ctx, sdk, envelope.Name(), "property", "set", key, value)
+}
+
+func runFirmwareToolWithConfig(ctx context.Context, sdk *SDK, envelopePath string, config map[string]interface{}, args ...string) error {
+	if config != nil {
+		configFile, err := os.CreateTemp("", "*.json.config")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(configFile.Name())
+
+		configBytes, err := json.Marshal(config)
+		if err != nil {
+			return err
+		}
+
+		if err := os.WriteFile(configFile.Name(), configBytes, 0666); err != nil {
+			return err
+		}
+
+		args = append(args, "--config", configFile.Name())
+	}
+	return runFirmwareTool(ctx, sdk, envelopePath, args...)
+}
+
+func runFirmwareTool(ctx context.Context, sdk *SDK, envelopePath string, args ...string) error {
+	args = append([]string{"-e", envelopePath}, args...)
+	cmd := sdk.FirmwareTool(ctx, args...)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	return cmd.Run()
+}
+
+func copySnapshotsIntoCache(ctx context.Context, sdk *SDK, envelope *os.File) error {
+	listFile, err := os.CreateTemp("", "firmware-list.*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(listFile.Name())
+
+	if err := runFirmwareTool(ctx, sdk, envelope.Name(), "container", "list", "--output-format", "json", "-o", listFile.Name()); err != nil {
+		return err
+	}
+
+	listBytes, err := os.ReadFile(listFile.Name())
+	if err != nil {
+		return err
+	}
+
+	var entries map[string]map[string]interface{}
+	if err := json.Unmarshal(listBytes, &entries); err != nil {
+		return err
+	}
+
+	for name, entry := range entries {
+		kind := entry["kind"]
+		if kind != "snapshot" {
+			continue
+		}
+
+		snapshotFile, err := os.CreateTemp("", "firmware-snapshot.*")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(snapshotFile.Name())
+
+		snapshotExtractArguments := []string{
+			"container", "extract",
+			"-o", snapshotFile.Name(),
+			"--part=image",
+			name,
+		}
+		if err := runFirmwareTool(ctx, sdk, envelope.Name(), snapshotExtractArguments...); err != nil {
+			return err
+		}
+
+		if err := copySnapshotIntoCache(snapshotFile.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copySnapshotIntoCache(path string) error {
+	uuid, err := GetUuid(path)
+	if err != nil {
+		return err
+	}
+
+	stateDirectory, err := directory.GetSnapshotsStatePath()
+	if err != nil {
+		return err
+	}
+
+	source, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	destination, err := os.Create(filepath.Join(stateDirectory, uuid.String()+".snapshot"))
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+
+	_, err = io.Copy(destination, source)
+	return err
+}

@@ -1,0 +1,428 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - "*"
+      - "*/*"
+  release:
+    # Note that edited doesn't trigger when the prerelease flag is changed.
+    # You also have to change the description slightly, if you want to change a
+    # prerelease to a release.
+    types: [ published, edited ]
+  workflow_dispatch:
+    inputs:
+      sign_macos:
+        description: Sign the macOS binary
+        type: boolean
+        required: true
+        default: false
+      sign_windows:
+        description: Sign the Windows binary
+        type: boolean
+        required: true
+        default: false
+
+jobs:
+  build_jag:
+    strategy:
+      matrix:
+        container: [ ubuntu-latest, ubuntu-22.04, macos-latest, windows-latest ]
+
+    runs-on: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.4"
+
+      - name: Install dependencies
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          choco install -y innosetup
+
+      - name: Build jag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" = "release" ]]; then
+            export JAG_BUILD_RELEASE=1
+          fi
+
+          RUNNER_OS=$(echo ${{ runner.os }} | tr '[:upper:]' '[:lower:]')
+
+          if [[ $RUNNER_OS = "windows" ]]; then
+            make JAG_BINARY=$RUNNER_OS/jag.exe jag
+          elif [[ $RUNNER_OS = "macos" ]]; then
+            GOOS=darwin GOARCH=amd64 make JAG_BINARY=$RUNNER_OS/jag_amd64 jag
+            GOOS=darwin GOARCH=arm64 make JAG_BINARY=$RUNNER_OS/jag_arm64 jag
+            lipo -create -output build/$RUNNER_OS/jag build/$RUNNER_OS/jag_amd64 build/$RUNNER_OS/jag_arm64
+            rm build/$RUNNER_OS/jag_amd64 build/$RUNNER_OS/jag_arm64
+          else
+            make JAG_BINARY=$RUNNER_OS/jag jag
+          fi
+
+          if [[ $RUNNER_OS = "linux" ]]; then
+            GOOS=linux GOARCH=arm make JAG_BINARY=$RUNNER_OS-arm/jag jag
+            GOOS=linux GOARCH=arm64 make JAG_BINARY=$RUNNER_OS-arm64/jag jag
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: jag-build-${{ matrix.container }}
+          path: |
+            build/linux/
+            build/linux-arm/
+            build/linux-arm64/
+            build/macos/
+            build/windows/
+
+      - name: Create archive Linux
+        if: runner.os == 'Linux'
+        working-directory: ./build/linux
+        run: |
+          tar -czf jag.tgz jag
+
+      - name: Create archive Linux ARM
+        if: runner.os == 'Linux'
+        working-directory: ./build/linux-arm
+        run: |
+          tar -czf jag-arm.tgz jag
+
+      - name: Create archive Linux ARM64
+        if: runner.os == 'Linux'
+        working-directory: ./build/linux-arm64
+        run: |
+          tar -czf jag-arm64.tgz jag
+
+      - name: Check version number
+        if: (github.event_name == 'release') && (runner.os == 'Linux')
+        working-directory: ./build/linux
+        # Check that the version numbers match.
+        # This is a sanity check to ensure that tools/prepare_release.sh was called.
+        run: |
+          ./jag --no-analytics version | head -n1 | grep --fixed-strings "${{ github.event.release.tag_name }}"
+
+      - name: Sign Windows binary
+        if: runner.os == 'Windows' && (github.event_name == 'release' || inputs.sign_windows)
+        uses: toitlang/action-sign-server@26db6e4021bfbd79af777d15964f1ab70bcfd3a4  # v1.0.7
+        with:
+          uri: ${{ vars.CERTUM_URI }}
+          password: ${{ secrets.CERTUM_PWD }}
+          path: build/windows/jag.exe
+
+      - name: Build Windows Zip
+        if: runner.os == 'Windows'
+        working-directory: ./build/windows
+        run: |
+          powershell Compress-Archive -Force jag.exe jag.zip
+
+      - name: Version number
+        if: (github.event_name == 'release') && (runner.os == 'Windows')
+        id: version
+        shell: powershell
+        run: |
+          $versionV = "${{ github.event.release.tag_name }}"
+          $version = $versionV.Substring(1)
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build Windows installer
+        if: (github.event_name == 'release') && (runner.os == 'Windows')
+        shell: powershell
+        run: |
+          & tools\windows_installer\build.bat ${{ steps.version.outputs.version }} $PWD\build\windows\jag.exe $PWD\jag_installer_x64.exe
+          move $PWD\jag_installer_x64.exe build/windows/jag_installer_x64.exe
+
+      - name: Sign Windows installer
+        if: (github.event_name == 'release') && (runner.os == 'Windows')
+        uses: toitlang/action-sign-server@26db6e4021bfbd79af777d15964f1ab70bcfd3a4  # v1.0.7
+        with:
+          uri: ${{ vars.CERTUM_URI }}
+          password: ${{ secrets.CERTUM_PWD }}
+          path: build/windows/jag_installer_x64.exe
+
+      - name: Prepare Windows release upload
+        if: (github.event_name == 'release') && (runner.os == 'Windows')
+        working-directory: ./build/windows
+        shell: bash
+        run: |
+          mkdir release
+          cp jag_installer_x64.exe release
+          cp jag_installer_x64.exe release/jag_installer.exe
+          # The filename 'jag_windows.zip' is used by the esp-idf installer.
+          # See https://github.com/espressif/idf-env/blob/681ec4a5056336e3a4573ceda3d7b27976ba3951/src/toit.rs#L18
+          cp jag.zip release/jag_windows.zip
+
+      - name: Upload Windows release files
+        if: (github.event_name == 'release') && (runner.os == 'Windows')
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: build/windows/release/*
+          file_glob: true
+          tag: ${{ github.event.release.tag_name }}
+          overwrite: true
+
+
+      - name: Download winget binary
+        if: (github.event_name == 'release') && (runner.os == 'Windows')
+        run: |
+          iwr https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+
+      - name: Update manifest
+        if: (github.event_name == 'release') && (runner.os == 'Windows')
+        run: |
+          .\wingetcreate.exe update Toit.Jaguar -s -v ${{ steps.version.outputs.version }} -u https://github.com/toitlang/jaguar/releases/download/${{ github.event.release.tag_name }}/jag_installer_x64.exe -t ${{ secrets.WINGET_PAT }}
+
+      - name: Prepare Linux release upload
+        if: (github.event_name == 'release') && (matrix.container == 'ubuntu-22.04')
+        working-directory: ./build
+        shell: bash
+        run: |
+          mkdir release
+          cp linux/jag.tgz release/jag_linux.tgz
+          cp linux-arm/jag-arm.tgz release/jag_linux_arm.tgz
+          cp linux-arm64/jag-arm64.tgz release/jag_linux_arm64.tgz
+
+      - name: Upload Linux release files
+        if: (github.event_name == 'release') && (matrix.container == 'ubuntu-22.04')
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: build/release/*
+          file_glob: true
+          tag: ${{ github.event.release.tag_name }}
+          overwrite: true
+
+  build_deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential debhelper golang git
+
+      - name: Build Debian package
+        run: |
+          dpkg-buildpackage -b -us -uc
+
+      - name: Move .deb file
+        run: |
+          mv ../jaguar_*.deb .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: jag-deb
+          path: jaguar_*.deb
+
+      - name: Upload Deb release file
+        if: github.event_name == 'release'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: jaguar_*.deb
+          file_glob: true
+          tag: ${{ github.event.release.tag_name }}
+          overwrite: true
+
+
+  sign_jag_macos:
+    runs-on: macos-latest
+    needs: [build_jag]
+    if: github.event_name == 'release' || inputs.sign_macos
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          set -e
+          brew install create-dmg
+          brew install zip
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: jag-build-macos-latest
+          path: build
+
+      - name: Setup binary rights
+        run: |
+          chmod +x build/macos/jag
+
+      - name: Sign and notarize
+        uses: toitlang/action-macos-sign-notarize@v1.3.0
+        with:
+          certificate: ${{ secrets.MACOS_CERTIFICATE }}
+          certificate-password: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          username: ${{ secrets.AC_USERNAME }}
+          password: ${{ secrets.AC_PASSWORD }}
+          apple-team-id: ${{ vars.MACOS_TEAM_ID}}
+          app-path: build/macos/jag
+
+      - name: Create a DMG
+        run: |
+          # Use an empty directory as source so we don't accidentally add other files than the
+          # jag binary.
+          set -e
+          mkdir empty
+          create-dmg \
+              --volname "jag" \
+              --add-file jag build/macos/jag 0 0 \
+              build/macos/jag.dmg \
+              empty
+
+      - name: Sign DMG
+        uses: toitlang/action-macos-sign-notarize@v1.3.0
+        with:
+          certificate: ${{ secrets.MACOS_CERTIFICATE }}
+          certificate-password: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          username: ${{ secrets.AC_USERNAME }}
+          password: ${{ secrets.AC_PASSWORD }}
+          apple-team-id: ${{ vars.MACOS_TEAM_ID }}
+          app-path: build/macos/jag.dmg
+
+      - name: Create a ZIP
+        run: |
+          zip -j build/macos/jag.zip build/macos/jag
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: jag-macos
+          path: build/macos/
+
+      - name: Upload jag macOS (zip)
+        if: github.event_name == 'release'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: build/macos/jag.zip
+          tag: ${{ github.event.release.tag_name }}
+          asset_name: jag_macos.zip
+          overwrite: true
+
+      - name: Upload jag macOS (dmg)
+        if: github.event_name == 'release'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: build/macos/jag.dmg
+          tag: ${{ github.event.release.tag_name }}
+          asset_name: jag.dmg
+          overwrite: true
+
+  build_assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.19
+
+      - name: Download SDK
+        run: |
+          make download-sdk
+
+      - name: Build assets
+        run: |
+          make assets
+          tar -czf build/assets.tar.gz -C ./build -h assets
+
+      - name: Upload assets
+        if: github.event_name == 'release'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: build/assets.tar.gz
+          tag: ${{ github.event.release.tag_name }}
+          overwrite: true
+          file_glob: true
+
+  AUR:
+    name: Update AUR packages
+    runs-on: ubuntu-latest
+    needs: [build_jag]
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version number
+        id: version
+        shell: bash
+        run: |
+          VERSION_WITH_V="${{ github.event.release.tag_name }}"
+          VERSION=${VERSION_WITH_V#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Ssh
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          echo "$AUR_SSH_KEY" > ${{ github.workspace }}/aur_ssh_key
+          chmod 600 ${{ github.workspace }}/aur_ssh_key
+
+          mkdir -p $HOME/.ssh
+          echo "Host aur.archlinux.org" >> $HOME/.ssh/config
+          echo "  IdentityFile ${{ github.workspace }}/aur_ssh_key" >> $HOME/.ssh/config
+          echo "  User aur" >> $HOME/.ssh/config
+
+          ssh-keyscan -H aur.archlinux.org > $HOME/.ssh/known_hosts
+
+      - name: Fetch AUR packages
+        run: |
+          git clone ssh://aur@aur.archlinux.org/jaguar.git
+          git clone ssh://aur@aur.archlinux.org/jaguar-bin.git
+
+      - name: Git
+        run: |
+          cd ${{ github.workspace }}/jaguar
+          git config user.email "leon@toit.io"
+          git config user.name "Leon Gungadin Mogensen"
+
+          cd ${{ github.workspace }}/jaguar-bin
+          git config user.email "leon@toit.io"
+          git config user.name "Leon Gungadin Mogensen"
+
+      - name: Update jaguar package
+        # We are using our own fork to work around
+        # https://github.com/hapakaien/archlinux-package-action/issues/32.
+        uses: toitlang/archlinux-package-action@main
+        with:
+          path: jaguar
+          pkgver: ${{ steps.version.outputs.version }}
+          pkgrel: 1
+          updpkgsums: true
+          srcinfo: true
+          # Workaround for https://github.com/hapakaien/archlinux-package-action/issues/23.
+          aur: true
+
+      - name: Update jaguar-bin package
+        uses: toitlang/archlinux-package-action@main
+        with:
+          path: jaguar-bin
+          pkgver: ${{ steps.version.outputs.version }}
+          pkgrel: 1
+          updpkgsums: true
+          srcinfo: true
+
+      - name: Upload
+        run: |
+          cat ${{ github.workspace }}/jaguar/PKGBUILD
+          cat ${{ github.workspace }}/jaguar/.SRCINFO
+          cat ${{ github.workspace }}/jaguar-bin/PKGBUILD
+          cat ${{ github.workspace }}/jaguar-bin/.SRCINFO
+
+          cd ${{ github.workspace }}/jaguar
+          git commit -am "Update to version ${{ github.event.release.tag_name }}"
+          git push origin master
+
+          cd ${{ github.workspace }}/jaguar-bin
+          git commit -am "Update to version ${{ github.event.release.tag_name }}"
+          git push origin master

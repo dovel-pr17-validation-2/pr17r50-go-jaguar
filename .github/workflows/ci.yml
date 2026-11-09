@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.4"
+
+      - name: Make
+        run: |
+          make jag
+
+      - name: Setup
+        run: |
+          JAG_BINARY=build/jag
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            JAG_BINARY=build/jag.exe
+          fi
+          $JAG_BINARY setup --skip-assets
+          SDK_PATH="$($JAG_BINARY setup --print-path sdk)"
+          ASSETS_PATH="$($JAG_BINARY setup --print-path assets)"
+          mkdir -p "$ASSETS_PATH"
+          make SDK_PATH="$SDK_PATH" assets
+          cp -r build/assets/* "$ASSETS_PATH"
+
+      - name: Run tests
+        run: |
+          make test
+
+      - name: Install Toit QEMU
+        if: runner.os == 'Linux'
+        uses: toitlang/action-setup@v1
+        with:
+          qemu-version: latest
+
+      - name: Test flashing an ESP32 in QEMU
+        if: runner.os == 'Linux'
+        run: tests/qemu-flash-test.sh
+
+      - name: Test UDP advertisement configuration in QEMU
+        if: runner.os == 'Linux'
+        run: tests/qemu-udp-test.sh
+
+      - name: Test console UART proxy in QEMU
+        if: runner.os == 'Linux'
+        run: tests/qemu-uart-test.sh
